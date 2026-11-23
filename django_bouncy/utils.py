@@ -24,7 +24,10 @@ import logging
 import six
 
 from ipaddress import ip_address
-from OpenSSL import crypto
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 from django.conf import settings
 from django.core.cache import caches
 from django.http import HttpResponse, HttpResponseBadRequest
@@ -77,6 +80,12 @@ Type
 {Type}
 '''
 
+# SNS SignatureVersion 1 signs with SHA1, SignatureVersion 2 with SHA256
+SIGNATURE_HASHES = {
+    '1': hashes.SHA1,
+    '2': hashes.SHA256,
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -113,9 +122,19 @@ def verify_notification(data):
 
     Returns True if verfied, False if not verified
     """
+    hash_algorithm = SIGNATURE_HASHES.get(data.get('SignatureVersion'))
+    if hash_algorithm is None:
+        logger.warning(
+            'Unsupported SignatureVersion %s', data.get('SignatureVersion'))
+        return False
+
     pemfile = grab_keyfile(data['SigningCertURL'])
-    cert = crypto.load_certificate(crypto.FILETYPE_PEM, pemfile)
-    signature = base64.decodestring(six.b(data['Signature']))
+    cert = x509.load_pem_x509_certificate(smart_bytes(pemfile))
+    try:
+        signature = base64.b64decode(data['Signature'])
+    except ValueError:
+        logger.warning('Signature Not Valid Base64')
+        return False
 
     if data['Type'] == "Notification":
         if 'Subject' in data:
@@ -126,9 +145,13 @@ def verify_notification(data):
         hash_format = SUBSCRIPTION_HASH_FORMAT
 
     try:
-        crypto.verify(
-            cert, signature, hash_format.format(**data).encode('utf-8'), 'sha1')
-    except crypto.Error:
+        cert.public_key().verify(
+            signature,
+            hash_format.format(**data).encode('utf-8'),
+            padding.PKCS1v15(),
+            hash_algorithm(),
+        )
+    except InvalidSignature:
         return False
     return True
 

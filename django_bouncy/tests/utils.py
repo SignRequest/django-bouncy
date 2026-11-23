@@ -1,4 +1,11 @@
 """Tests for utils.py in the django-bouncy app"""
+import base64
+import datetime
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.x509.oid import NameOID
 from django.conf import settings
 from django.dispatch import receiver
 try:
@@ -73,6 +80,85 @@ class TestVerificationSystem(BouncyTestCase):
         result = utils.verify_notification(notification)
 
         self.assertFalse(result)
+
+
+class TestSignatureVersions(BouncyTestCase):
+    """Test verification against a locally generated signing certificate"""
+    @classmethod
+    def setUpClass(cls):
+        super(TestSignatureVersions, cls).setUpClass()
+        cls.private_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048)
+        name = x509.Name(
+            [x509.NameAttribute(NameOID.COMMON_NAME, u'sns.amazonaws.com')])
+        now = datetime.datetime.utcnow()
+        certificate = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(cls.private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .sign(cls.private_key, hashes.SHA256())
+        )
+        cls.signing_pem = certificate.public_bytes(serialization.Encoding.PEM)
+
+    def sign(self, notification, signature_version, hash_algorithm):
+        """Return a copy of notification signed like SNS would sign it"""
+        signed = dict(notification, SignatureVersion=signature_version)
+        payload = utils.NOTIFICATION_HASH_FORMAT.format(**signed)
+        signed['Signature'] = base64.b64encode(self.private_key.sign(
+            payload.encode('utf-8'), padding.PKCS1v15(), hash_algorithm()
+        )).decode('ascii')
+        return signed
+
+    @patch('django_bouncy.utils.grab_keyfile')
+    def test_signature_version_1(self, mock):
+        """SignatureVersion 1 notifications are verified with SHA1"""
+        mock.return_value = self.signing_pem
+        notification = self.sign(self.notification, '1', hashes.SHA1)
+        self.assertTrue(utils.verify_notification(notification))
+
+    @patch('django_bouncy.utils.grab_keyfile')
+    def test_signature_version_2(self, mock):
+        """SignatureVersion 2 notifications are verified with SHA256"""
+        mock.return_value = self.signing_pem
+        notification = self.sign(self.notification, '2', hashes.SHA256)
+        self.assertTrue(utils.verify_notification(notification))
+
+    @patch('django_bouncy.utils.grab_keyfile')
+    def test_hash_mismatch(self, mock):
+        """A SHA1 signature is rejected when SignatureVersion claims 2"""
+        mock.return_value = self.signing_pem
+        notification = self.sign(self.notification, '1', hashes.SHA1)
+        notification['SignatureVersion'] = '2'
+        self.assertFalse(utils.verify_notification(notification))
+
+    @patch('django_bouncy.utils.grab_keyfile')
+    def test_tampered_message(self, mock):
+        """A notification modified after signing is rejected"""
+        mock.return_value = self.signing_pem
+        notification = self.sign(self.notification, '2', hashes.SHA256)
+        notification['Message'] = notification['Message'].replace(
+            'Permanent', 'Transient')
+        self.assertFalse(utils.verify_notification(notification))
+
+    @patch('django_bouncy.utils.grab_keyfile')
+    def test_unknown_signature_version(self, mock):
+        """Unknown signature versions are rejected without fetching a key"""
+        notification = self.sign(self.notification, '1', hashes.SHA1)
+        notification['SignatureVersion'] = '3'
+        self.assertFalse(utils.verify_notification(notification))
+        mock.assert_not_called()
+
+    @patch('django_bouncy.utils.grab_keyfile')
+    def test_malformed_signature(self, mock):
+        """A signature that is not valid base64 is rejected"""
+        mock.return_value = self.signing_pem
+        notification = self.sign(self.notification, '1', hashes.SHA1)
+        notification['Signature'] = 'not-base64!'
+        self.assertFalse(utils.verify_notification(notification))
 
 
 class SubscriptionApprovalTest(BouncyTestCase):
